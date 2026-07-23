@@ -19,7 +19,9 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           ECWID_STORE_ID: ${{ secrets.ECWID_STORE_ID }}
           ECWID_PUBLIC_TOKEN: ${{ secrets.ECWID_PUBLIC_TOKEN }}
-          STORE_NAME: ${{ secrets.STORE_NAME }}
+          ECWID_STORE_NAME: ${{ secrets.ECWID_STORE_NAME }}
+          WIX_BASE_URL: ${{ secrets.WIX_BASE_URL }}
+          WIX_STORE_NAME: ${{ secrets.WIX_STORE_NAME }}
         run: node tracker.js
       - name: Guardar estado
         run: |

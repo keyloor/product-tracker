@@ -1,103 +1,65 @@
-// Tracker de productos nuevos para una tienda Ecwid.
-// Consulta la API pública de Ecwid, detecta productos nuevos comparando contra
-// un archivo de estado (state/seen.json) y envía un email con Resend.
+// Tracker de productos nuevos de Pokémon en varias tiendas.
 //
-// Toda la configuración viene por variables de entorno: el repositorio no
-// contiene datos de la tienda ni direcciones de correo.
+// Cada tienda tiene un adaptador (adapters/) que sabe cómo listar sus productos
+// publicados. El orquestador compara contra el estado, filtra lo que es de
+// Pokémon y envía un solo correo con todo lo nuevo.
+//
+// Toda la configuración viene por entorno: el repositorio no contiene datos de
+// las tiendas ni direcciones de correo.
 //
 // Sin dependencias: usa fetch nativo de Node 18+.
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { crearAdaptadorEcwid } from "./adapters/ecwid.js";
+import { crearAdaptadorWix } from "./adapters/wix.js";
 
-// ---- Configuración (toda por entorno; ver .env.example) ----
-const STORE_ID = process.env.ECWID_STORE_ID;
-const ECWID_TOKEN = process.env.ECWID_PUBLIC_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const MAIL_TO = process.env.MAIL_TO;
 const MAIL_FROM = process.env.MAIL_FROM || "Alertas <onboarding@resend.dev>";
 const STATE_FILE = process.env.STATE_FILE || "state/seen.json";
-const STORE_NAME = process.env.STORE_NAME || "la tienda";
 
-// Acepta "Pokemon" y "Pokémon" (con y sin tilde).
-const POKEMON_RE = /pok[eé]mon/i;
+// Las tiendas se definen por entorno para no dejarlas escritas en el repo.
+function construirTiendas() {
+  const tiendas = [];
 
-const API_BASE = `https://app.ecwid.com/api/v3/${STORE_ID}/products`;
+  if (process.env.ECWID_STORE_ID && process.env.ECWID_PUBLIC_TOKEN) {
+    tiendas.push(
+      crearAdaptadorEcwid({
+        storeId: process.env.ECWID_STORE_ID,
+        token: process.env.ECWID_PUBLIC_TOKEN,
+        nombre: process.env.ECWID_STORE_NAME || "Tienda 1",
+        clave: "ecwid",
+      }),
+    );
+  }
+  if (process.env.WIX_BASE_URL) {
+    tiendas.push(
+      crearAdaptadorWix({
+        baseUrl: process.env.WIX_BASE_URL.replace(/\/+$/, ""),
+        nombre: process.env.WIX_STORE_NAME || "Tienda 2",
+        clave: "wix",
+      }),
+    );
+  }
+  return tiendas;
+}
 
-// ---- Utilidades ----
-async function loadSeen() {
+// ---- Estado: un conjunto de ids por tienda ----
+async function loadState() {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    return new Set(data.ids || []);
+    return JSON.parse(raw);
   } catch (err) {
     if (err.code === "ENOENT") return null; // primera corrida
     throw err;
   }
 }
 
-async function saveSeen(idSet) {
+async function saveState(state) {
   await mkdir(dirname(STATE_FILE), { recursive: true });
-  const payload = {
-    updatedAt: new Date().toISOString(),
-    count: idSet.size,
-    ids: [...idSet].sort((a, b) => a - b),
-  };
-  await writeFile(STATE_FILE, JSON.stringify(payload, null, 2) + "\n");
-}
-
-// Trae TODOS los productos del catálogo (paginado).
-async function fetchAllProducts() {
-  const products = [];
-  const limit = 100;
-  let offset = 0;
-  let total = Infinity;
-
-  while (offset < total) {
-    const url =
-      `${API_BASE}?token=${ECWID_TOKEN}` +
-      `&sortBy=ADDED_TIME_DESC&limit=${limit}&offset=${offset}` +
-      `&responseFields=total,count,items(id,name,enabled,created,url,imageUrl,defaultDisplayedPriceFormatted,categoryIds)`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`Ecwid API respondió ${res.status}: ${await res.text()}`);
-    }
-    const data = await res.json();
-    total = data.total ?? products.length;
-    products.push(...(data.items || []));
-    if (!data.items || data.items.length === 0) break;
-    offset += limit;
-  }
-  return products;
-}
-
-// Trae el arbol de categorias y devuelve los ids que cuelgan de (o son) una
-// categoria de Pokemon. Se resuelve en cada corrida en vez de hardcodear ids:
-// si la tienda crea una subcategoria nueva de Pokemon, entra sola.
-async function fetchPokemonCategoryIds() {
-  const url =
-    `https://app.ecwid.com/api/v3/${STORE_ID}/categories?token=${ECWID_TOKEN}` +
-    `&limit=100&responseFields=items(id,name,parentId)`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Ecwid categorías respondió ${res.status}`);
-  }
-  const { items = [] } = await res.json();
-  const byId = new Map(items.map((c) => [c.id, c]));
-
-  // Una categoria cuenta si ella misma o cualquier ancestro dice "Pokemon".
-  const esPokemon = (cat) => {
-    let actual = cat;
-    const vistos = new Set();
-    while (actual && !vistos.has(actual.id)) {
-      vistos.add(actual.id);
-      if (POKEMON_RE.test(actual.name || "")) return true;
-      actual = actual.parentId ? byId.get(actual.parentId) : null;
-    }
-    return false;
-  };
-
-  return new Set(items.filter(esPokemon).map((c) => c.id));
+  state.updatedAt = new Date().toISOString();
+  await writeFile(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
 
 function escapeHtml(s = "") {
@@ -108,71 +70,74 @@ function escapeHtml(s = "") {
     .replaceAll('"', "&quot;");
 }
 
-function buildEmail(newProducts) {
-  const plural = newProducts.length === 1 ? "producto nuevo" : "productos nuevos";
-  const subject = `⚡ ${newProducts.length} ${plural} de Pokémon en ${STORE_NAME}`;
+function buildEmail(porTienda, total) {
+  const plural = total === 1 ? "producto nuevo" : "productos nuevos";
+  const subject = `⚡ ${total} ${plural} de Pokémon`;
 
-  const cards = newProducts
-    .map((p) => {
-      const img = p.imageUrl
-        ? `<img src="${escapeHtml(p.imageUrl)}" alt="" width="90" height="90" style="border-radius:8px;object-fit:cover;display:block">`
-        : "";
-      const price = p.defaultDisplayedPriceFormatted
-        ? `<div style="color:#111;font-weight:600;margin-top:4px">${escapeHtml(p.defaultDisplayedPriceFormatted)}</div>`
-        : "";
-      // Los que llegan sin categoría no se pudieron clasificar: se avisan igual
-      // y se marcan, para que ninguno pase desapercibido.
-      const aviso = p.revisar
-        ? `<div style="color:#b26a00;font-size:12px;margin-top:4px">⚠️ Sin categoría — puede no ser de Pokémon</div>`
-        : "";
-      return `
+  const secciones = porTienda
+    .map(({ tienda, productos }) => {
+      const filas = productos
+        .map((p) => {
+          const img = p.imageUrl
+            ? `<img src="${escapeHtml(p.imageUrl)}" alt="" width="80" height="80" style="border-radius:8px;object-fit:cover;display:block">`
+            : "";
+          const precio = p.defaultDisplayedPriceFormatted
+            ? `<div style="color:#111;font-weight:600;margin-top:4px">${escapeHtml(p.defaultDisplayedPriceFormatted)}</div>`
+            : "";
+          const aviso =
+            p.clase === "dudoso"
+              ? `<div style="color:#b26a00;font-size:12px;margin-top:4px">⚠️ No se pudo confirmar que sea de Pokémon</div>`
+              : "";
+          return `
       <tr>
-        <td style="padding:12px 0;border-bottom:1px solid #eee;vertical-align:top;width:100px">${img}</td>
+        <td style="padding:12px 0;border-bottom:1px solid #eee;vertical-align:top;width:92px">${img}</td>
         <td style="padding:12px 0 12px 14px;border-bottom:1px solid #eee;vertical-align:top">
           <a href="${escapeHtml(p.url)}" style="color:#0a58ca;font-size:16px;font-weight:600;text-decoration:none">${escapeHtml(p.name || "(sin nombre)")}</a>
-          ${price}
+          ${precio}
           ${aviso}
-          <div style="color:#888;font-size:12px;margin-top:4px">Agregado: ${escapeHtml(p.created || "—")}</div>
         </td>
       </tr>`;
+        })
+        .join("");
+
+      return `
+      <h3 style="margin:22px 0 2px;font-size:15px;color:#444">${escapeHtml(tienda)}</h3>
+      <table style="width:100%;border-collapse:collapse">${filas}</table>`;
     })
     .join("");
 
   const html = `
   <div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:560px;margin:0 auto;color:#222">
     <h2 style="margin:0 0 4px">Nuevos productos de Pokémon</h2>
-    <p style="color:#666;margin:0 0 16px">Se detectaron <b>${newProducts.length}</b> ${plural} en ${escapeHtml(STORE_NAME)}.</p>
-    <table style="width:100%;border-collapse:collapse">${cards}</table>
-    <p style="color:#aaa;font-size:12px;margin-top:20px">Notificación automática · monitor de catálogo Ecwid</p>
+    <p style="color:#666;margin:0 0 6px">Se detectaron <b>${total}</b> ${plural}.</p>
+    ${secciones}
+    <p style="color:#aaa;font-size:12px;margin-top:20px">Notificación automática</p>
   </div>`;
 
-  const text = newProducts
-    .map((p) => `• ${p.name || "(sin nombre)"} — ${p.defaultDisplayedPriceFormatted || ""}\n  ${p.url}`)
+  const text = porTienda
+    .map(
+      ({ tienda, productos }) =>
+        `== ${tienda} ==\n` +
+        productos
+          .map(
+            (p) =>
+              `• ${p.name}${p.clase === "dudoso" ? " [revisar]" : ""} — ${p.defaultDisplayedPriceFormatted || ""}\n  ${p.url}`,
+          )
+          .join("\n\n"),
+    )
     .join("\n\n");
 
   return { subject, html, text };
 }
 
 async function sendEmail({ subject, html, text }) {
-  if (!RESEND_API_KEY) {
-    throw new Error("Falta RESEND_API_KEY en el entorno.");
-  }
-  if (!MAIL_TO) {
-    throw new Error("Falta MAIL_TO en el entorno (configúralo como secret).");
-  }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${RESEND_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      from: MAIL_FROM,
-      to: [MAIL_TO],
-      subject,
-      html,
-      text,
-    }),
+    body: JSON.stringify({ from: MAIL_FROM, to: [MAIL_TO], subject, html, text }),
   });
   if (!res.ok) {
     throw new Error(`Resend respondió ${res.status}: ${await res.text()}`);
@@ -180,79 +145,104 @@ async function sendEmail({ subject, html, text }) {
   return res.json();
 }
 
+async function enviarAviso(asunto, cuerpo) {
+  await sendEmail({
+    subject: asunto,
+    html: `<p style="font-family:system-ui,Arial,sans-serif">${escapeHtml(cuerpo)}</p>`,
+    text: cuerpo,
+  });
+}
+
 // ---- Flujo principal ----
 async function main() {
-  if (!STORE_ID || !ECWID_TOKEN) {
-    throw new Error(
-      "Faltan ECWID_STORE_ID y/o ECWID_PUBLIC_TOKEN en el entorno.",
-    );
+  if (!RESEND_API_KEY) throw new Error("Falta RESEND_API_KEY en el entorno.");
+  if (!MAIL_TO) throw new Error("Falta MAIL_TO en el entorno.");
+
+  const tiendas = construirTiendas();
+  if (tiendas.length === 0) {
+    throw new Error("No hay tiendas configuradas (revisa las variables de entorno).");
   }
 
-  const products = await fetchAllProducts();
+  const stateAnterior = await loadState();
+  const primeraCorrida = stateAnterior === null;
+  const state = stateAnterior ?? { tiendas: {} };
+  state.tiendas ??= {};
 
-  // Solo interesan los productos VISIBLES en la tienda. El resto son fichas
-  // ocultas que la API devuelve sin nombre: si se guardaran como vistas, al
-  // publicarse (caso típico de una pre-orden) ya no se detectarían como nuevas.
-  const visible = products.filter((p) => p.enabled && p.name);
-  const currentIds = new Set(visible.map((p) => p.id));
-  console.log(
-    `Catálogo: ${products.length} productos, ${visible.length} visibles.`,
-  );
-  // Sin nombres ni ids: los logs de Actions son públicos en un repo público.
+  const porTienda = [];
+  const fallos = [];
+  let cambioEstado = false;
 
-  const seen = await loadSeen();
+  for (const tienda of tiendas) {
+    // Cada tienda va aislada: si una falla, las demás siguen.
+    try {
+      const publicados = await tienda.listarPublicados();
+      const idsActuales = publicados.map((p) => String(p.id));
+      console.log(`${tienda.clave}: ${publicados.length} productos publicados.`);
 
-  // Primera corrida: registrar todo sin notificar (evita cientos de emails).
-  if (seen === null) {
-    await saveSeen(currentIds);
-    console.log("Primera corrida: estado inicial guardado, sin notificaciones.");
-    return;
+      const previo = state.tiendas[tienda.clave];
+
+      // Primera vez que se ve esta tienda: registrar sin notificar.
+      if (!previo) {
+        state.tiendas[tienda.clave] = { ids: idsActuales.sort() };
+        cambioEstado = true;
+        console.log(`${tienda.clave}: estado inicial guardado, sin notificar.`);
+        continue;
+      }
+
+      const vistos = new Set(previo.ids || []);
+      const nuevos = publicados.filter((p) => !vistos.has(String(p.id)));
+
+      if (nuevos.length === 0) continue;
+
+      // Solo se descarga el detalle de los nuevos, que son pocos.
+      const detallados = await tienda.detallar(nuevos);
+      const interesantes = detallados.filter(
+        (p) => p.clase === "pokemon" || p.clase === "dudoso",
+      );
+
+      if (interesantes.length > 0) {
+        porTienda.push({ tienda: tienda.nombre, productos: interesantes });
+      }
+
+      // Los ids solo se agregan, nunca se quitan.
+      state.tiendas[tienda.clave] = {
+        ids: [...new Set([...vistos, ...idsActuales])].sort(),
+      };
+      cambioEstado = true;
+      console.log(
+        `${tienda.clave}: ${nuevos.length} nuevos, ${interesantes.length} de interés.`,
+      );
+    } catch (err) {
+      console.error(`${tienda.clave}: FALLÓ -> ${err.message}`);
+      fallos.push(`${tienda.clave}: ${err.message}`);
+    }
   }
 
-  // Un producto se considera de Pokemon si esta en una categoria de Pokemon o
-  // si su propio nombre lo menciona (hay productos como "Sleeves Charmander"
-  // que no lo llevan en el nombre, y otros que podrian llegar sin categoria).
-  const pokeCats = await fetchPokemonCategoryIds();
-  const esPokemon = (p) =>
-    (p.categoryIds || []).some((c) => pokeCats.has(c)) ||
-    POKEMON_RE.test(p.name || "");
+  const total = porTienda.reduce((n, t) => n + t.productos.length, 0);
 
-  // Sin categoria no se puede clasificar. En vez de descartarlo en silencio
-  // -que es como se escaparia uno-, se notifica marcado para revisar.
-  const sinCategoria = (p) => !(p.categoryIds || []).length;
-
-  const recienPublicados = visible.filter((p) => !seen.has(p.id));
-  const newProducts = recienPublicados
-    .filter((p) => esPokemon(p) || sinCategoria(p))
-    .map((p) => ({ ...p, revisar: !esPokemon(p) }));
-
-  // Los ids solo se agregan, nunca se quitan: si un producto se oculta y luego
-  // vuelve, no se notifica de nuevo porque no es realmente nuevo.
-  const updatedSeen = new Set([...seen, ...currentIds]);
-
-  // Si el conjunto no cambió, no reescribir el archivo: evita un commit
-  // inútil en cada corrida (el tracker corre cada 5 minutos).
-  if (updatedSeen.size === seen.size) {
-    console.log("Sin productos nuevos (estado sin cambios).");
-    return;
+  if (total > 0) {
+    await sendEmail(buildEmail(porTienda, total));
+    console.log(`Email enviado con ${total} producto(s).`);
+  } else if (!primeraCorrida) {
+    console.log("Sin novedades de Pokémon.");
   }
 
-  if (newProducts.length === 0) {
-    await saveSeen(updatedSeen);
-    console.log("Sin productos nuevos, pero el catálogo cambió; estado actualizado.");
-    return;
+  // Un adaptador roto (típico en Wix) no puede quedarse callado.
+  if (fallos.length > 0) {
+    try {
+      await enviarAviso(
+        "⚠️ El tracker falló en una tienda",
+        `No se pudo revisar:\n\n${fallos.join("\n")}`,
+      );
+    } catch (err) {
+      console.error("Además falló el aviso por correo:", err.message);
+    }
   }
 
-  // No se registran nombres ni ids: en un repo público los logs de Actions
-  // también son públicos.
-  console.log(`¡${newProducts.length} producto(s) nuevo(s)!`);
+  if (cambioEstado) await saveState(state);
 
-  const email = buildEmail(newProducts);
-  await sendEmail(email);
-  console.log("Email enviado.");
-
-  // Guardar estado solo después de enviar con éxito.
-  await saveSeen(updatedSeen);
+  // Si TODAS las tiendas fallaron, la corrida se marca como fallida.
+  if (fallos.length === tiendas.length) process.exit(1);
 }
 
 main().catch((err) => {
