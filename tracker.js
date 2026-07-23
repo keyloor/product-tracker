@@ -19,6 +19,9 @@ const MAIL_FROM = process.env.MAIL_FROM || "Alertas <onboarding@resend.dev>";
 const STATE_FILE = process.env.STATE_FILE || "state/seen.json";
 const STORE_NAME = process.env.STORE_NAME || "la tienda";
 
+// Acepta "Pokemon" y "Pokémon" (con y sin tilde).
+const POKEMON_RE = /pok[eé]mon/i;
+
 const API_BASE = `https://app.ecwid.com/api/v3/${STORE_ID}/products`;
 
 // ---- Utilidades ----
@@ -54,7 +57,7 @@ async function fetchAllProducts() {
     const url =
       `${API_BASE}?token=${ECWID_TOKEN}` +
       `&sortBy=ADDED_TIME_DESC&limit=${limit}&offset=${offset}` +
-      `&responseFields=total,count,items(id,name,enabled,created,url,imageUrl,defaultDisplayedPriceFormatted)`;
+      `&responseFields=total,count,items(id,name,enabled,created,url,imageUrl,defaultDisplayedPriceFormatted,categoryIds)`;
     const res = await fetch(url);
     if (!res.ok) {
       throw new Error(`Ecwid API respondió ${res.status}: ${await res.text()}`);
@@ -68,6 +71,35 @@ async function fetchAllProducts() {
   return products;
 }
 
+// Trae el arbol de categorias y devuelve los ids que cuelgan de (o son) una
+// categoria de Pokemon. Se resuelve en cada corrida en vez de hardcodear ids:
+// si la tienda crea una subcategoria nueva de Pokemon, entra sola.
+async function fetchPokemonCategoryIds() {
+  const url =
+    `https://app.ecwid.com/api/v3/${STORE_ID}/categories?token=${ECWID_TOKEN}` +
+    `&limit=100&responseFields=items(id,name,parentId)`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Ecwid categorías respondió ${res.status}`);
+  }
+  const { items = [] } = await res.json();
+  const byId = new Map(items.map((c) => [c.id, c]));
+
+  // Una categoria cuenta si ella misma o cualquier ancestro dice "Pokemon".
+  const esPokemon = (cat) => {
+    let actual = cat;
+    const vistos = new Set();
+    while (actual && !vistos.has(actual.id)) {
+      vistos.add(actual.id);
+      if (POKEMON_RE.test(actual.name || "")) return true;
+      actual = actual.parentId ? byId.get(actual.parentId) : null;
+    }
+    return false;
+  };
+
+  return new Set(items.filter(esPokemon).map((c) => c.id));
+}
+
 function escapeHtml(s = "") {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -78,7 +110,7 @@ function escapeHtml(s = "") {
 
 function buildEmail(newProducts) {
   const plural = newProducts.length === 1 ? "producto nuevo" : "productos nuevos";
-  const subject = `🃏 ${newProducts.length} ${plural} en ${STORE_NAME}`;
+  const subject = `⚡ ${newProducts.length} ${plural} de Pokémon en ${STORE_NAME}`;
 
   const cards = newProducts
     .map((p) => {
@@ -88,12 +120,18 @@ function buildEmail(newProducts) {
       const price = p.defaultDisplayedPriceFormatted
         ? `<div style="color:#111;font-weight:600;margin-top:4px">${escapeHtml(p.defaultDisplayedPriceFormatted)}</div>`
         : "";
+      // Los que llegan sin categoría no se pudieron clasificar: se avisan igual
+      // y se marcan, para que ninguno pase desapercibido.
+      const aviso = p.revisar
+        ? `<div style="color:#b26a00;font-size:12px;margin-top:4px">⚠️ Sin categoría — puede no ser de Pokémon</div>`
+        : "";
       return `
       <tr>
         <td style="padding:12px 0;border-bottom:1px solid #eee;vertical-align:top;width:100px">${img}</td>
         <td style="padding:12px 0 12px 14px;border-bottom:1px solid #eee;vertical-align:top">
           <a href="${escapeHtml(p.url)}" style="color:#0a58ca;font-size:16px;font-weight:600;text-decoration:none">${escapeHtml(p.name || "(sin nombre)")}</a>
           ${price}
+          ${aviso}
           <div style="color:#888;font-size:12px;margin-top:4px">Agregado: ${escapeHtml(p.created || "—")}</div>
         </td>
       </tr>`;
@@ -102,8 +140,8 @@ function buildEmail(newProducts) {
 
   const html = `
   <div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:560px;margin:0 auto;color:#222">
-    <h2 style="margin:0 0 4px">Nuevos productos en ${STORE_NAME}</h2>
-    <p style="color:#666;margin:0 0 16px">Se detectaron <b>${newProducts.length}</b> ${plural} en la tienda.</p>
+    <h2 style="margin:0 0 4px">Nuevos productos de Pokémon</h2>
+    <p style="color:#666;margin:0 0 16px">Se detectaron <b>${newProducts.length}</b> ${plural} en ${escapeHtml(STORE_NAME)}.</p>
     <table style="width:100%;border-collapse:collapse">${cards}</table>
     <p style="color:#aaa;font-size:12px;margin-top:20px">Notificación automática · monitor de catálogo Ecwid</p>
   </div>`;
@@ -160,6 +198,7 @@ async function main() {
   console.log(
     `Catálogo: ${products.length} productos, ${visible.length} visibles.`,
   );
+  // Sin nombres ni ids: los logs de Actions son públicos en un repo público.
 
   const seen = await loadSeen();
 
@@ -170,7 +209,22 @@ async function main() {
     return;
   }
 
-  const newProducts = visible.filter((p) => !seen.has(p.id));
+  // Un producto se considera de Pokemon si esta en una categoria de Pokemon o
+  // si su propio nombre lo menciona (hay productos como "Sleeves Charmander"
+  // que no lo llevan en el nombre, y otros que podrian llegar sin categoria).
+  const pokeCats = await fetchPokemonCategoryIds();
+  const esPokemon = (p) =>
+    (p.categoryIds || []).some((c) => pokeCats.has(c)) ||
+    POKEMON_RE.test(p.name || "");
+
+  // Sin categoria no se puede clasificar. En vez de descartarlo en silencio
+  // -que es como se escaparia uno-, se notifica marcado para revisar.
+  const sinCategoria = (p) => !(p.categoryIds || []).length;
+
+  const recienPublicados = visible.filter((p) => !seen.has(p.id));
+  const newProducts = recienPublicados
+    .filter((p) => esPokemon(p) || sinCategoria(p))
+    .map((p) => ({ ...p, revisar: !esPokemon(p) }));
 
   // Los ids solo se agregan, nunca se quitan: si un producto se oculta y luego
   // vuelve, no se notifica de nuevo porque no es realmente nuevo.
