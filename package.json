@@ -1,0 +1,13 @@
+{
+  "name": "product-tracker",
+  "version": "1.0.0",
+  "description": "Notifica por email (Resend) cuando aparecen productos nuevos en una tienda Ecwid.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node tracker.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,34 @@
+name: Tracker de productos
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Ejecutar tracker
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          ECWID_STORE_ID: ${{ secrets.ECWID_STORE_ID }}
+          ECWID_PUBLIC_TOKEN: ${{ secrets.ECWID_PUBLIC_TOKEN }}
+          STORE_NAME: ${{ secrets.STORE_NAME }}
+        run: node tracker.js
+      - name: Guardar estado
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name "product-tracker[bot]"
+            git config user.email "product-tracker@users.noreply.github.com"
+            git add state/
+            git commit -m "chore: actualizar estado [skip ci]"
+            git push
+          else
+            echo "Sin cambios."
+          fi
